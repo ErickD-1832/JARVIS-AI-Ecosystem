@@ -6,6 +6,7 @@ import datetime
 import edge_tts
 import asyncio
 import pygame
+import geocoder
 
 #---Configuracion ---
 #---mongoDB
@@ -19,9 +20,10 @@ memoria = db['conversaciones']
 genai.configure(api_key="")
 client_groq = Groq(api_key="")
 
+
 def hablar(texto):
     """Genera voz neuronal humana al instante"""
-    print(f"\nJARVIS: {texto}")
+    print(f"\n💠 JARVIS: {texto}")
     
     # Elegimos una voz de hombre, profesional y clara
     # 'es-ES-AlvaroNeural' suena muy parecido a un asistente moderno
@@ -72,8 +74,8 @@ def obtener_contexto(pregunta_actual=""):
     recuerdos = list(memoria.find(query).sort("fecha", -1).limit(10))
     
     # 4. DEBUG EN CONSOLA (Para que tú veas qué está pasando)
-    print(f"---> [SISTEMA] Buscando: '{limpia}'")
-    print(f"---> [SISTEMA] Recuerdos encontrados: {len(recuerdos)}")
+    print(f"🌐 [SISTEMA] Buscando: '{limpia}'")
+    print(f"🧠 [SISTEMA] Recuerdos encontrados: {len(recuerdos)}")
 
     if not recuerdos:
         # Si no encuentra nada específico, trae lo último que se habló
@@ -95,56 +97,76 @@ def obtener_contexto(pregunta_actual=""):
         
     return texto_contexto
 
+# Obtener la ubicación actual del usuario (esto es opcional, pero puede ser útil para respuestas contextuales)
+
+def obtener_ubicacion():
+    try:
+        # Detecta ubicación por IP
+        g = geocoder.ip('me')
+        if g.city:
+            return f"{g.city}, {g.country}"
+        return "Desconocida"
+    except Exception:
+        return "No disponible"
+
 def obtener_respuesta(pregunta_actual):
-    # 1. Recuperamos la memoria local (Esto funciona SIEMPRE, con o sin internet)
+    # 1. Recuperamos el historial de MongoDB
     historial = obtener_contexto(pregunta_actual)
     
-    # --- EL TRUCO DEL MODO OFFLINE ---
-    # Si preguntas algo exacto que ya está en la DB, te lo responde directamente
-    # sin pasar por Gemini.
-    palabras_usuario = pregunta_actual.lower().split()
-    # Buscamos si hay una respuesta exacta para esta pregunta en el historial
-    busqueda_directa = memoria.find_one({"pregunta": {"$regex": pregunta_actual, "$options": "i"}})
+    # 2. CAPTURAMOS DATOS REALES (TIEMPO Y ESPACIO)
+    ahora = datetime.datetime.now()
+    fecha_hora_actual = ahora.strftime("%A, %d de %B de %Y, %H:%M:%S")
+    ubicacion = obtener_ubicacion()
     
-    if busqueda_directa:
-        return f"{busqueda_directa['respuesta']}", "MemoriaLocal"
-    # ----------------------------------
+    # 3. FILTRO CRÍTICO: ¿Es una pregunta sobre tiempo o lugar?
+    # Esto evita que JARVIS lea respuestas viejas de la base de datos
+    palabras_clave = ["hora", "fecha", "día", "donde estoy", "ubicación", "donde me encuentro", "donde vivo"]
+    es_pregunta_tiempo_real = any(p in pregunta_actual.lower() for p in palabras_clave)
 
-    # Si no es una pregunta exacta, intentamos usar la IA
-    instrucciones = "Eres JARVIS. Usa la memoria para responder: \n"
+    # 4. MODO OFFLINE / MEMORIA DIRECTA
+    # Solo usamos la respuesta guardada si NO es algo que requiera datos en tiempo real
+    if not es_pregunta_tiempo_real:
+        busqueda_directa = memoria.find_one({"pregunta": {"$regex": pregunta_actual, "$options": "i"}})
+        if busqueda_directa:
+            return f"{busqueda_directa['respuesta']}", "MemoriaLocal"
+
+    # 5. PROMPT DE PERSONALIDAD (Aquí le "inyectamos" la realidad a la IA)
+    instrucciones = (
+        f"Eres JARVIS, un asistente avanzado. \n"
+        f"DATOS DE SENSORES EN TIEMPO REAL:\n"
+        f"📡 Ubicación: {ubicacion}\n"
+        f"🕒 Fecha y Hora: {fecha_hora_actual}\n"
+        f"Usa estos datos para responder si el usuario pregunta por ellos. \n"
+        f"HISTORIAL DE CONVERSACIÓN:\n"
+    )
+    
     prompt_final = f"{instrucciones}{historial}\nUsuario: {pregunta_actual}"
     
     try:
-        # CAMBIA ESTO A 2.5-FLASH PARA TENER 1500 PETICIONES GRATIS
+        # Usamos gemini 2.5-flash para evitar el error de librería obsoleta
         model = genai.GenerativeModel('gemini-2.5-flash') 
         response = model.generate_content(prompt_final)
         return response.text, "Gemini"
     
     except Exception as e:
-        # Si Gemini falla por saldo, JARVIS al menos intenta leer lo que recuperó de Mongo
-        print(f"Error de API (Saldo): {e}")
-        
-        
-    # INTENTO 2: GROQ (El respaldo gratuito y rápido)
+        print(f"❌ Error de Gemini: {e}")
+        # RESPALDO CON GROQ
         try:
             chat_completion = client_groq.chat.completions.create(
                 messages=[
-                    {"role": "system", "content": "Eres JARVIS, un asistente inteligente y profesional."},
+                    {"role": "system", "content": f"Eres JARVIS. Ubicación: {ubicacion}. Hora: {fecha_hora_actual}."},
                     {"role": "user", "content": prompt_final}
                 ],
-                # Cambia 'llama3-8b-8192' por este:
                 model="llama-3.1-8b-instant", 
             )
             return chat_completion.choices[0].message.content, "Groq"
-        
         except Exception as e_groq:
             print(f"Error en Groq: {e_groq}")
-            return "Señor, todos mis sistemas de inteligencia están caídos. Revise sus conexiones.", "None"
-    
+            return "❌ Señor, mis sistemas de datos están fuera de línea.", "None"
     
 #--- BUCLE PRINCIPAL ---
 while True:
-    usuario = input("\nEscribe tu comando:")
+    usuario = input("\n👤 Señor, escriba su comando: ")
     if usuario.lower() in ["salir", "exit"]: break
     
     respuesta, ia_utilizada = obtener_respuesta(usuario)
