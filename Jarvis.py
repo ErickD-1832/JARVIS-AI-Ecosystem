@@ -109,6 +109,7 @@ def obtener_ubicacion():
     except Exception:
         return "No disponible"
 
+
 def obtener_respuesta(pregunta_actual):
     # 1. Recuperamos el historial de MongoDB
     historial = obtener_contexto(pregunta_actual)
@@ -121,14 +122,27 @@ def obtener_respuesta(pregunta_actual):
     # 3. FILTRO CRÍTICO: ¿Es una pregunta sobre tiempo o lugar?
     # Esto evita que JARVIS lea respuestas viejas de la base de datos
     palabras_clave = ["hora", "fecha", "día", "donde estoy", "ubicación", "donde me encuentro", "donde vivo"]
-    es_pregunta_tiempo_real = any(p in pregunta_actual.lower() for p in palabras_clave)
+    
 
-    # 4. MODO OFFLINE / MEMORIA DIRECTA
-    # Solo usamos la respuesta guardada si NO es algo que requiera datos en tiempo real
-    if not es_pregunta_tiempo_real:
-        busqueda_directa = memoria.find_one({"pregunta": {"$regex": pregunta_actual, "$options": "i"}})
-        if busqueda_directa:
-            return f"{busqueda_directa['respuesta']}", "MemoriaLocal"
+    # 4. MODO OFFLINE INTELIGENTE 🧠 (Búsqueda por coincidencia de palabras)
+    pregunta_segura = re.escape(pregunta_actual)
+
+    limpia = "".join(e for e in pregunta_actual if e.isalnum() or e.isspace())
+    palabras = [re.escape(p) for p in limpia.split()]
+    
+    if not palabras:
+        recientes = list(memoria.find().sort("fecha", -1).limit(5))
+        return "\n".join([f"Usuario: {m['pregunta']}\nJARVIS: {m['respuesta']}" for m in recientes])
+
+    # 3. Usamos la pregunta_segura en el query
+    query = {"$or": [
+        {"pregunta": {"$regex": pregunta_segura, "$options": "i"}}, 
+        {"pregunta": {"$regex": "|".join(palabras), "$options": "i"}} 
+    ]}
+    
+    # El resto del código sigue igual...
+    recuerdos = list(memoria.find(query).sort("fecha", -1).limit(10))
+    # ... (tu código de ordenar y limpiar duplicados)
 
     # 5. PROMPT DE PERSONALIDAD (Aquí le "inyectamos" la realidad a la IA)
     instrucciones = (
@@ -177,3 +191,7 @@ while True:
         
     
     hablar(respuesta)
+    
+    
+
+
