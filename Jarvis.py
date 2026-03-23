@@ -34,8 +34,13 @@ db = client['Jarvis']
 memoria = db['conversaciones']
 
 # APIS (aqui ponemos las llaves)
+
 client_gemini = genai.Client(api_key="")
 client_groq = Groq(api_key="")
+
+client_gemini = genai.Client(api_key="")
+client_groq = Groq(api_key="")
+
 
 # Silenciar advertencias de ALSA y Jack
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
@@ -419,6 +424,4 @@ while True:
 print("\n👋 JARVIS se está apagando. ¡Hasta luego!")
     
     
-
-
 
