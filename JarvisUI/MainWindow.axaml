@@ -1,0 +1,42 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="JarvisUI.MainWindow"
+        Title="JARVIS Core" Height="500" Width="400"
+        TransparencyLevelHint="AcrylicBlur"
+        Background="Transparent"
+        ExtendClientAreaToDecorationsHint="True">
+
+    <Panel>
+        <ExperimentalAcrylicBorder IsHitTestVisible="False">
+            <ExperimentalAcrylicBorder.Material>
+                <ExperimentalAcrylicMaterial
+                    BackgroundSource="Digger"
+                    TintColor="Black"
+                    TintOpacity="0.8"
+                    MaterialOpacity="0.65" />
+            </ExperimentalAcrylicBorder.Material>
+        </ExperimentalAcrylicBorder>
+
+        <Grid RowDefinitions="*,Auto">
+            <StackPanel Grid.Row="0" Margin="20" VerticalAlignment="Center">
+                <Ellipse Name="JarvisEye" Width="100" Height="100" Fill="Cyan">
+                    <Ellipse.Effect>
+                        <DropShadowEffect BlurRadius="20" Color="Cyan" Opacity="0.5"/>
+                    </Ellipse.Effect>
+                </Ellipse>
+                <TextBlock Name="StatusText" Text="SISTEMA EN LINEA" 
+                           HorizontalAlignment="Center" Foreground="Cyan" 
+                           Margin="0,20,0,0" FontWeight="Bold"/>
+                <ScrollViewer Height="200" Margin="0,20">
+                    <TextBlock Name="ChatDisplay" TextWrapping="Wrap" Foreground="White" Text="Esperando cerebro..."/>
+                </ScrollViewer>
+            </StackPanel>
+
+            <Border Grid.Row="1" Background="#222" CornerRadius="10" Margin="15" Padding="5">
+                <TextBox Name="UserInput" Watermark="Ordene, señor..." 
+                         Background="Transparent" BorderThickness="0"
+                         Foreground="White" KeyDown="OnKeyDown"/>
+            </Border>
+        </Grid>
+    </Panel>
+</Window>
