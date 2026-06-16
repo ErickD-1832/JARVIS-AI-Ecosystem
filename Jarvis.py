@@ -1,6 +1,63 @@
+from datetime import datetime
+from sys import flags
+import ctypes
 import os
+import sys
+import subprocess
+ 
+# Variables de entorno ANTES de cualquier import de audio
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['PYTHONWARNINGS'] = 'ignore'
+os.environ['JACK_NO_AUDIO_RESERVATION'] = '1'
+os.environ['SDL_AUDIODRIVER'] = 'alsa'        # Fuerza SDL a usar ALSA directamente
+ 
+# Suprimir ALSA ANTES de cualquier import de audio
+def silenciar_alsa():
+    try:
+        libasound = ctypes.CDLL('libasound.so.2')
+        ERROR_HANDLER = ctypes.CFUNCTYPE(
+            None, ctypes.c_char_p, ctypes.c_int,
+            ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p
+        )
+        libasound.snd_lib_error_set_handler(
+            ERROR_HANDLER(lambda *_: None)
+        )
+        print("✅ [AUDIO] ALSA silenciado correctamente")
+    except Exception as e:
+        print(f"⚠️ [AUDIO] No se pudo silenciar ALSA: {e}")
+ 
+silenciar_alsa()  # ← DEBE SER LO PRIMERO ANTES DE CUALQUIER IMPORT DE AUDIO
+ 
+# Filtrar mensajes de JACK/PortAudio del stderr (los que llegan igual)
+class FiltroStderr:
+    BASURA = (
+        "ALSA lib", "Cannot connect to server",
+        "jack server", "JackShmReadWritePtr",
+        "Cannot open device", "snd_func_refer",
+        "snd_config_expand", "Unable to find definition",
+        "Expression 'paInvalidSampleRate'"
+    )
+    def __init__(self, fd_original):
+        self.fd = fd_original
+    def write(self, data):
+        if not any(b in data for b in self.BASURA):
+            self.fd.write(data)
+    def flush(self):
+        self.fd.flush()
+    def fileno(self):
+        return self.fd.fileno()
+ 
+sys.stderr = FiltroStderr(sys.stderr)
+
+
 import datetime
 import asyncio
+import io
+import re
+import threading
+import socket
+ 
 import pygame
 import geocoder
 import re
@@ -10,18 +67,22 @@ import edge_tts
 from google import genai
 from groq import Groq
 from pymongo import MongoClient
-from evdev import InputDevice, categorize, ecodes, list_devices # BAJO NIVEL
-import ctypes
+from evdev import InputDevice, categorize, ecodes, list_devices
 import cv2
 from PIL import Image
 import socket
 
 
+# ANTES (causa conflicto con ALSA):
+pygame.mixer.init()
 
+# DESPUÉS (fuerza parámetros seguros):
 try:
+    pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=1024)
     pygame.mixer.init()
+    pygame.init()
 except Exception as e:
-    print(f"⚠️ Nota: Audio no inicializado ({e})")
+    print(f"⚠️ Audio: {e}")
 
 MODO_VOZ = False
 INTERRUMPIR = False
@@ -34,27 +95,8 @@ db = client['Jarvis']
 memoria = db['conversaciones']
 
 # APIS (aqui ponemos las llaves)
-
 client_gemini = genai.Client(api_key="")
 client_groq = Groq(api_key="")
-
-client_gemini = genai.Client(api_key="")
-client_groq = Groq(api_key="")
-
-
-# Silenciar advertencias de ALSA y Jack
-os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
-# Esto redirige los errores de C (ALSA) a la nada
-
-libasound = ctypes.CDLL('libasound.so.2')
-def silenciar_alsa():
-    asound_error_handler = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
-    def ignore_error(filename, line, function, err, fmt): pass
-    c_ignore_error = asound_error_handler(ignore_error)
-    libasound.snd_lib_error_set_handler(c_ignore_error)
-
-silenciar_alsa()
 
 def servidor_para_esqueleto():
     # Creamos un socket para escuchar a C#
@@ -125,64 +167,102 @@ def monitoreo_teclado_bajo_nivel():
 # Lanzamos el hilo de hardware inmediatamente
 threading.Thread(target=monitoreo_teclado_bajo_nivel, daemon=True).start()
 
+audio_lock = threading.Lock()
+
+class SensorOido:
+    def __init__(self):
+        self.recognizer = sr.Recognizer()
+        self.device_index = 4  
+        self.recognizer.energy_threshold = 300
+        self.recognizer.dynamic_energy_threshold = False  
+        self.recognizer.pause_threshold = 0.8
+
+    def escuchar(self):
+        mic = None
+        try:
+            # Usamos el candado para que ningún otro hilo (como evdev) 
+            # interfiera en la inicialización en C del hardware de audio.
+            with audio_lock:
+                mic = sr.Microphone(device_index=self.device_index)
+                # Forzamos una inicialización manual interna protegida por el lock
+                if not hasattr(mic, "audio"):
+                    mic.__enter__()
+                    mic_abierto_manualmente = True
+                else:
+                    mic_abierto_manualmente = False
+
+            # Fuera del lock ya podemos proceder a escuchar el buffer de forma segura
+            with mic as fuente:
+                print("👂 [SISTEMA] Escuchando...")
+                audio = self.recognizer.listen(fuente, timeout=5, phrase_time_limit=10)
+                
+            print("🧠 [SISTEMA] Procesando voz...")
+            peticion = self.recognizer.recognize_google(audio, language="es-ES")
+            print(f"👤 Señor: {peticion}")
+            return peticion
+
+        except sr.WaitTimeoutError:
+            return None
+        except sr.UnknownValueError:
+            print("⚠️ [SISTEMA] No entendí el audio.")
+            return None
+        except Exception as e:
+            print(f"❌ Error inesperado en mic: {e}")
+            return None
+        finally:
+            # Liberación segura libre de NoneType errors
+            if mic is not None:
+                try:
+                    if 'mic_abierto_manualmente' in locals() and mic_abierto_manualmente:
+                        mic.__exit__(None, None, None)
+                except Exception:
+                    pass
+ 
+
 
 def hablar(texto):
-    """Genera voz neuronal humana al instante"""
-    
-    global INTERRUMPIR
-    INTERRUMPIR = False  # Reiniciamos la bandera de interrupción cada vez que hablamos
-    
-    print(f"\n💠 JARVIS: {texto}")
-    
-    # Elegimos una voz de hombre, profesional y clara
-    # 'es-ES-AlvaroNeural' suena muy parecido a un asistente moderno
-    VOZ = "es-ES-AlvaroNeural" 
-    ARCHIVO_AUDIO = "respuesta.mp3"
+    """Genera voz con edge_tts y reproduce con pygame de forma segura"""
+    if not texto or not texto.strip():
+        return
 
-    async def comunicacion():
-        communicate = edge_tts.Communicate(texto, VOZ, rate="+10%", pitch="-5Hz")
-        await communicate.save(ARCHIVO_AUDIO)
+    async def _generar_y_reproducir():
+        import io
+        try:
+            tts = edge_tts.Communicate(texto, voice="es-MX-JorgeNeural")
+            audio_bytes = io.BytesIO()
+
+            async for chunk in tts.stream():
+                if chunk["type"] == "audio":
+                    audio_bytes.write(chunk["data"])
+
+            audio_bytes.seek(0)
+
+            if audio_bytes.getbuffer().nbytes == 0:
+                print("[VOZ] ❌ TTS no generó audio")
+                return
+
+            pygame.mixer.music.load(audio_bytes)
+            pygame.mixer.music.play()
+
+            while pygame.mixer.music.get_busy():
+                if INTERRUMPIR:
+                    pygame.mixer.music.stop()
+                    break
+                pygame.time.Clock().tick(10)
+
+        except Exception as e:
+            print(f"[VOZ] ❌ Error: {e}")
 
     try:
-        asyncio.run(comunicacion())
-        pygame.mixer.music.load(ARCHIVO_AUDIO)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy():
-            if INTERRUMPIR: break
-            pygame.time.Clock().tick(10)
-        pygame.mixer.music.unload()
-    except: pass
+        asyncio.run(_generar_y_reproducir())
+    except RuntimeError:
+        # Si ya hay un event loop corriendo (caso edge)
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(_generar_y_reproducir())
+        loop.close()
     
         
-        
-def escuchar_microfono():
-    r = sr.Recognizer()
-    # Ajustes de sensibilidad para que no sea tan "sordo"
-    r.energy_threshold = 300 
-    r.dynamic_energy_threshold = True
-    
-    # FORZAMOS EL ÍNDICE 10 (El 'default' de tu lista)
-    try:
-        with sr.Microphone(device_index=10) as source:
-            print("🎤 [JARVIS] Escuchando... (Hable ahora)")
-            # Reducimos el tiempo de ajuste para que sea más rápido
-            r.adjust_for_ambient_noise(source, duration=0.8)
-            
-            try:
-                # Ponemos límites para que no se bloquee el programa
-                audio = r.listen(source, timeout=5, phrase_time_limit=8)
-                print("🧠 [JARVIS] Analizando...")
-                texto = r.recognize_google(audio, language="es-ES")
-                print(f"👤 Usted dijo: {texto}")
-                return texto
-            except sr.WaitTimeoutError:
-                return None
-            except sr.UnknownValueError:
-                print("❓ [JARVIS] No entendí el audio.")
-                return None
-    except Exception as e:
-        print(f"❌ Error de hardware de audio: {e}")
-        return None
+
 
 def guardar_en_db(pregunta, respuesta, ia_usada):
     log = {
@@ -247,8 +327,42 @@ def obtener_ubicacion():
         return "Desconocida"
     except Exception:
         return "No disponible"
+
+
+def clear_text(text):
+    """
+    Elimina símbolos de formato Markdown (#, *, _, `, etc.)
+    que Gemini/Groq agregan y que estorban al hablar/leer.
+    """
+    if not text:
+        return text
+
+    text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
     
-    
+    # Quitar negritas/cursivas: **texto**, *texto*, __texto__, _texto_
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', text)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'_(.+?)_', r'\1', text)
+
+    # Quitar bullets de listas: -, *, + al inicio de línea
+    text = re.sub(r'^[\-\*\+]\s+', '', text, flags=re.MULTILINE)
+
+    # Quitar código en línea o bloques: `texto` o ```texto```
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`(.+?)`', r'\1', text)
+ 
+    # Quitar cualquier # o * sueltos que queden
+    text = text.replace('#', '').replace('*', '')
+ 
+    # Limpiar espacios/líneas extra que dejan los reemplazos
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = text.strip()
+ 
+    return text
+
 def capturar_vision():
     """Tomar una foto y guardar temporalmente"""
     cap = cv2.VideoCapture(0)
@@ -344,8 +458,7 @@ def obtener_respuesta(pregunta_actual):
         f"Usuario: {pregunta_actual}\n"
         f"JARVIS:"
     )
-    
-    
+
     try:
         # Si capturamos una imagen, enviamos una lista con [texto, imagen]
         if imagen_path:
@@ -362,7 +475,7 @@ def obtener_respuesta(pregunta_actual):
         if imagen_path and os.path.exists(imagen_path):
             os.remove(imagen_path)
             
-        return response.text, "Gemini"
+        return clear_text(response.text), "Gemini"
     
     except Exception as e:
         print(f"❌ Error de Gemini: {e}")
@@ -378,15 +491,18 @@ def obtener_respuesta(pregunta_actual):
                     {"role": "system", "content": f"Eres JARVIS. Ubicación: {ubicacion}. Hora: {fecha_hora_actual}."},
                     {"role": "user", "content": prompt_final}
                 ],
-                model="llama-3.1-8b-instant", 
+                model="meta-llama/llama-4-scout-17b-16e-instruct"
+, 
             )
             if imagen_path and os.path.exists(imagen_path):
                 os.remove(imagen_path) # Limpiamos la foto aunque Groq no la use
             
-            return chat_completion.choices[0].message.content + aviso_vision,  "Groq"
+            return clear_text(chat_completion.choices[0].message.content) + aviso_vision, "Groq"
         except Exception as e_groq:
             print(f"Error en Groq: {e_groq}")
             return "❌ Señor, mis sistemas de datos están fuera de línea.", "None"
+
+        
         
 
 #--- BUCLE PRINCIPAL ---
@@ -394,11 +510,27 @@ print("🚀 JARVIS ACTIVADO CON CONTROL DE HARDWARE")
 print("⌨️  F2: Modo Híbrido | 🛑 ESC: Interrumpir voz")
 
 # --- BUCLE PRINCIPAL DINÁMICO ---
+oido = SensorOido()
+
+hour_now = datetime.datetime.now().hour
+if 5 <= hour_now < 12:
+    saludo = "Buenos días"
+elif 12 <= hour_now < 19:
+    saludo = "Buenas tardes"
+else:
+    saludo = "Buenas noches"
+
+mensaje_bienvenida = ("Todos los sistemas en línea. Diagnóstico completo sin anomalías. "
+                    "Conexión con los núcleos de inteligencia establecida. "
+                        f"{saludo}, señor. JARVIS a su disposición.")
+print(f"\n🤖 JARVIS: {mensaje_bienvenida}")
+hablar(mensaje_bienvenida)
+
 while True:
     try:
         if MODO_VOZ:
             # Iniciamos la escucha
-            usuario = escuchar_microfono()
+            usuario = oido.escuchar()
             
             # Si no captó nada o cambiaste el modo mientras escuchaba
             if not usuario:
@@ -424,4 +556,3 @@ while True:
 print("\n👋 JARVIS se está apagando. ¡Hasta luego!")
     
     
-
